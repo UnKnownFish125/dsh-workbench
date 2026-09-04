@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+data/*.db
+data/*.db-*
+data/*.faiss
+data/dim.json
+__pycache__/
+*.pyc
+.tmp/
+.venv/
+*.tgz

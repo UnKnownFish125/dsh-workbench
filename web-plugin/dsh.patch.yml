@@ -1,0 +1,6 @@
+# The dsh-workbench bundle patch: registers the workbench UI surface plugin
+# (host half: /worktree-api proxy to the local worktree-server; client half: the
+# "工作台" view tab in the conversation view ring).
+- insert:
+    - id: workbench-ui
+      name: 'dsh-workbench'
