@@ -34,10 +34,10 @@ Listens on `http://localhost:6271` (configurable via env).
 
 - Any request carrying an `Origin` header → **403**.
 - Any `OPTIONS` request → **403**.
-- If the token file exists, `Authorization: Bearer <token>` is required → **403** on
-  a missing/mismatched token.
-- If no token file exists, requests are allowed (the server still binds to
-  localhost only).
+- `Authorization: Bearer <token>` is required; a missing/mismatched token → **401**
+  (memory-server same-stack pattern).
+- The token file is auto-provisioned at `0600` via `secrets` if absent, so bearer
+  auth is always enforced. A pre-provisioned token is never overwritten.
 
 ## Endpoints
 

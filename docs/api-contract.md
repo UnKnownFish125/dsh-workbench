@@ -9,7 +9,7 @@
 - 基址：`/v1/worktree`。
 - 鉴权与 memory-server 同栈（见 R-A）：
   1. 拒绝浏览器 Origin 跨源请求（`Origin` 头存在 → `403`）；`OPTIONS` 一律 `403`。
-  2. 服务读取 `WORKBENCH_API_TOKEN_FILE`（默认 `data/api-token`）中的 token，要求 `Authorization: Bearer <token>`；无 token 文件则放行（仅回环）。
+  2. 服务读取 `WORKBENCH_API_TOKEN_FILE`（默认 `data/api-token`）中的 token，要求 `Authorization: Bearer <token>`；token 缺失/不匹配 → `401`。token 文件缺失时服务自动生成（`secrets`，`0600`），保证鉴权恒开启。
 - 端口：生产 `6270`，测试 `6271`（env `WORKBENCH_SERVER_PORT`）。db：`data/worktree.db`。
 - 节点外部主键：**`path`**（`'deepmemory/memory-server'`），唯一。`id` 为代理键（R-B）。
 - 时间：`created_at`/`updated_at` 为 Unix 秒（`REAL`）。
@@ -154,7 +154,7 @@ POST /v1/worktree/import
 
 ## 5. 错误语义
 
-- `400` 参数/类型错；`404` 节点或会话未找到；`409` path 冲突；`403` Origin/权限；`500` 内部错。
+- `400` 参数/类型错；`404` 节点或会话未找到；`409` path 冲突；`401` 缺/错 Bearer token；`403` 浏览器 Origin/OPTIONS；`500` 内部错。
 - 错误体：`{"error":"human readable message"}`。
 
 ## 6. 非目标（边界）

@@ -304,9 +304,9 @@ class TestHTTPServer(unittest.TestCase):
         self.assertEqual(body["db"], "worktree.db")
 
     def test_auth_required(self):
-        # no token -> 403
+        # no token -> 401 (memory-server same-stack pattern; api-contract §5)
         status, body = self._req("GET", "/v1/health", token=None)
-        self.assertEqual(status, 403)
+        self.assertEqual(status, 401)
         self.assertIn("error", body)
 
     def test_auth_origin_rejected(self):

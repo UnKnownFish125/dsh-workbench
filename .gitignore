@@ -5,6 +5,10 @@ data/*.db
 data/*.db-*
 data/*.faiss
 data/dim.json
+# worktree runtime data (any nested data/ dir: db + WAL + api-token credential)
+**/data/*.db
+**/data/*.db-*
+**/data/api-token
 __pycache__/
 *.pyc
 .tmp/

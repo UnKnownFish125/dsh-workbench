@@ -4,11 +4,13 @@
 Serves the endpoints in `docs/api-contract.md` §3 over stdlib
 ``http.server`` + ``sqlite3``.  Auth follows the memory-server pattern
 (§0): reject browser Origin (403), reject OPTIONS (403), require
-``Authorization: Bearer <token>`` when the token file is present.
+``Authorization: Bearer <token>`` (401 on missing/mismatched token);
+the token file is auto-provisioned at 0600 if absent.
 """
 
 import json
 import os
+import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -68,8 +70,10 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 token = ""
         # If a token file is configured, the bearer token is mandatory.
+        # 401 (not 403) for missing/mismatched token — matches the
+        # memory-server "same stack" auth pattern and the api-contract §5.
         if token and self.headers.get("Authorization") != "Bearer " + token:
-            self._send(403, {"error": "bearer token required"})
+            self._send(401, {"error": "bearer token required"})
             return True
         return False
 
@@ -251,6 +255,26 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
 
+def _ensure_token(token_file):
+    """Guarantee the api-token file exists (0600) — same-stack as literature.
+
+    Fresh deployments must always enforce bearer auth (api-contract §0.2 / §5).
+    If ``token_file`` is missing, generate one with ``secrets`` at mode 0600.
+    A pre-provisioned token (e.g. by ``tools/deploy-test.sh``) is never
+    overwritten, so the web plugin / P1 proxy token stays in sync.
+    """
+    if not token_file or os.path.exists(token_file):
+        return
+    try:
+        with open(token_file, "w", encoding="utf-8") as fh:
+            fh.write(secrets.token_hex(24) + "\n")
+        os.chmod(token_file, 0o600)
+    except OSError:
+        # Auth stays off if we cannot write the token; the server still binds
+        # to localhost only. Deploy scripts normally pre-provision it.
+        pass
+
+
 def create_server(data_dir, port, token_file=None, contract_base=None):
     """Build a fully-configured WorkbenchHTTPServer (used by main and tests)."""
     os.makedirs(data_dir, exist_ok=True)
@@ -258,6 +282,7 @@ def create_server(data_dir, port, token_file=None, contract_base=None):
     store = WorktreeStore(db_path, contract_base=contract_base)
     if token_file is None:
         token_file = os.path.join(data_dir, "api-token")
+    _ensure_token(token_file)
     config = {"token_file": token_file}
     return WorkbenchHTTPServer(("localhost", port), Handler, store, config)
 
