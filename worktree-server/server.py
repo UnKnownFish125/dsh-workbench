@@ -14,10 +14,17 @@ import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from worktree import ConflictError, NotFoundError, ValidationError, WorktreeStore
+from worktree import (
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+    WorktreeStore,
+    normalize_path,
+)
 
 API_VERSION = "0.1.0"
 DB_NAME = "worktree.db"
+MAX_BODY_BYTES = 1024 * 1024  # reject request bodies above ~1MB (400)
 
 
 class WorkbenchHTTPServer(ThreadingHTTPServer):
@@ -57,22 +64,30 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _reject(self):
-        """Contract §0: reject browser Origin and missing/mismatched token."""
-        if self.headers.get("Origin"):
+        """Contract §0: reject browser Origin and missing/mismatched token.
+
+        Auth is **fail-closed**: if no bearer token is configured/readable the
+        request is rejected (401) rather than allowed through anonymously.
+        """
+        # Existence of an Origin header (even empty) ⇒ browser cross-site ⇒ 403.
+        if "Origin" in self.headers:
             self._send(403, {"error": "browser origin is not allowed"})
             return True
         token_file = self.config.get("token_file")
         token = ""
-        if token_file and os.path.exists(token_file):
+        if token_file:
             try:
                 with open(token_file, encoding="utf-8") as fh:
                     token = fh.read().strip()
             except OSError:
                 token = ""
-        # If a token file is configured, the bearer token is mandatory.
-        # 401 (not 403) for missing/mismatched token — matches the
-        # memory-server "same stack" auth pattern and the api-contract §5.
-        if token and self.headers.get("Authorization") != "Bearer " + token:
+        expected = "Bearer " + token if token else None
+        provided = self.headers.get("Authorization")
+        # Fail-closed: a missing/empty token must deny, never allow anonymous.
+        if not expected:
+            self._send(401, {"error": "bearer token required"})
+            return True
+        if not provided or not secrets.compare_digest(provided, expected):
             self._send(401, {"error": "bearer token required"})
             return True
         return False
@@ -87,15 +102,21 @@ class Handler(BaseHTTPRequestHandler):
             raise ValidationError("invalid Content-Length") from exc
         if length < 0:
             raise ValidationError("invalid Content-Length")
+        if length > MAX_BODY_BYTES:
+            raise ValidationError("request body too large")
         if length == 0:
             return {}
         payload = self.rfile.read(length)
         if not payload:
             return {}
         try:
-            return json.loads(payload)
+            obj = json.loads(payload)
         except (ValueError, TypeError) as exc:
             raise ValidationError("invalid JSON body") from exc
+        if not isinstance(obj, dict):
+            # Contract: JSON payloads are objects, not arrays/scalars.
+            raise ValidationError("body must be a JSON object")
+        return obj
 
     def _path_parts(self):
         parsed = urlparse(self.path)
@@ -103,8 +124,8 @@ class Handler(BaseHTTPRequestHandler):
         return parts, parse_qs(parsed.query)
 
     def _node_path(self, parts):
-        """Reassemble the `<path>` captured after the fixed prefix."""
-        return "/".join(parts[3:])
+        """Reassemble the `<path>` captured after the fixed prefix, normalized."""
+        return normalize_path("/".join(parts[3:]))
 
     # ---- error dispatch ------------------------------------------------
 
@@ -256,23 +277,38 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _ensure_token(token_file):
-    """Guarantee the api-token file exists (0600) — same-stack as literature.
+    """Guarantee a non-empty bearer token exists (0600), atomically.
 
-    Fresh deployments must always enforce bearer auth (api-contract §0.2 / §5).
-    If ``token_file`` is missing, generate one with ``secrets`` at mode 0600.
-    A pre-provisioned token (e.g. by ``tools/deploy-test.sh``) is never
-    overwritten, so the web plugin / P1 proxy token stays in sync.
+    A token file is mandatory for bearer auth (api-contract §0.2 / §5).  If
+    ``token_file`` is absent or empty we provision a fresh one with ``secrets``
+    using an atomic write (tmp + ``os.replace``), so a crashed write never
+    leaves a partial/empty token.  If we cannot read *or* provision a valid
+    token we raise, so the server refuses to start without auth — never serves
+    anonymously (no fail-open).
     """
-    if not token_file or os.path.exists(token_file):
-        return
+    if not token_file:
+        raise RuntimeError("token_file is required for bearer auth")
+    if os.path.exists(token_file):
+        try:
+            with open(token_file, encoding="utf-8") as fh:
+                if fh.read().strip():
+                    return
+        except OSError:
+            pass
+        # Existing file is empty/unreadable: fall through and re-provision it.
+    token = secrets.token_hex(24) + "\n"
+    tmp = token_file + ".tmp." + secrets.token_hex(4)
     try:
-        with open(token_file, "w", encoding="utf-8") as fh:
-            fh.write(secrets.token_hex(24) + "\n")
-        os.chmod(token_file, 0o600)
-    except OSError:
-        # Auth stays off if we cannot write the token; the server still binds
-        # to localhost only. Deploy scripts normally pre-provision it.
-        pass
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(token)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, token_file)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise RuntimeError("cannot provision api-token: %s" % exc) from exc
 
 
 def create_server(data_dir, port, token_file=None, contract_base=None):

@@ -27,6 +27,7 @@ from worktree import (  # noqa: E402
     NotFoundError,
     ValidationError,
     WorktreeStore,
+    normalize_path,
 )
 
 import server  # noqa: E402
@@ -84,6 +85,11 @@ class TestStore(unittest.TestCase):
         )
 
     def test_create_and_serialization_shape(self):
+        # A node's parent must exist (validated on create), so seed the chain.
+        self.store.create_node("deepmemory", kind="root", name="deepmemory")
+        self.store.create_node(
+            "deepmemory/主体", parent_path="deepmemory", kind="component", name="主体"
+        )
         node = self.store.create_node(
             "deepmemory/memory-server",
             parent_path="deepmemory/主体",
@@ -239,6 +245,127 @@ class TestStore(unittest.TestCase):
     def test_import_bad_source(self):
         with self.assertRaises(ValidationError):
             self.store.import_nodes(source="nope", nodes=[])
+
+    def test_normalize_path_rejects_bad(self):
+        bad = ["", "a/../b", "a/./b", "/etc/passwd", "a\x00b", "a/" + "b" * 600]
+        for p in bad:
+            with self.assertRaises(ValidationError):
+                normalize_path(p)
+        self.assertEqual(
+            normalize_path("deepmemory/memory-server"), "deepmemory/memory-server"
+        )
+
+    def test_create_requires_existing_parent(self):
+        with self.assertRaises(NotFoundError):
+            self.store.create_node("a/b", parent_path="a", kind="component", name="b")
+
+    def test_create_rejects_cycle(self):
+        self.store.create_node("a", kind="root", name="a")
+        self.store.create_node("a/b", parent_path="a", kind="component", name="b")
+        # self-parenting
+        with self.assertRaises(ValidationError):
+            self.store.create_node(
+                "a/b/c", parent_path="a/b/c", kind="component", name="c"
+            )
+
+    def test_update_rejects_cycle(self):
+        self.store.create_node("a", kind="root", name="a")
+        self.store.create_node("a/b", parent_path="a", kind="component", name="b")
+        self.store.create_node("a/b/c", parent_path="a/b", kind="component", name="c")
+        # move `a` under its own descendant -> cycle
+        with self.assertRaises(ValidationError):
+            self.store.update_node("a", {"parent_path": "a/b/c"})
+        # self-parent
+        with self.assertRaises(ValidationError):
+            self.store.update_node("a", {"parent_path": "a"})
+
+    def test_delete_cascades(self):
+        self.store.create_node("a", kind="root", name="a")
+        self.store.create_node("a/b", parent_path="a", kind="component", name="b")
+        self.store.create_node("a/b/c", parent_path="a/b", kind="component", name="c")
+        self.store.set_session_link("a/b/c", "sess-1")
+        res = self.store.delete_node("a")
+        self.assertEqual(res["deleted"], 3)
+        self.assertEqual(res["links"], 1)
+        for p in ("a", "a/b", "a/b/c"):
+            self.assertIsNone(self.store.get_node(p))
+
+    def test_session_link_unique_mount(self):
+        self._seed()
+        self.store.create_node(
+            "deepmemory/other", parent_path="deepmemory", kind="component", name="other"
+        )
+        self.store.set_session_link("deepmemory/主体", "sess-unique")
+        self.store.set_session_link("deepmemory/other", "sess-unique")
+        s = self.store.get_session("sess-unique")
+        self.assertEqual(s["node_path"], "deepmemory/other")
+        links = self.store.get_node_links("deepmemory/主体")
+        self.assertFalse(
+            any(
+                l["kind"] == "session" and l["ref"] == "sess-unique" for l in links
+            )
+        )
+
+    def test_contract_rejects_traversal_on_write(self):
+        # A traversal contract_ref is rejected up front (create/update).
+        with self.assertRaises(ValidationError):
+            self.store.create_node(
+                "esc", kind="component", name="esc", contract_ref="../../etc/passwd"
+            )
+        self.store.create_node("upd", kind="component", name="upd")
+        with self.assertRaises(ValidationError):
+            self.store.update_node("upd", {"contract_ref": "/etc/passwd"})
+
+    def test_contract_read_hardened_for_legacy_data(self):
+        # Simulate legacy/corrupt data inserted directly (bypassing validation)
+        # so get_contract must still refuse to read outside the base.
+        self.store.conn.execute(
+            "INSERT INTO worktree_nodes (path, parent_path, kind, name, desc, "
+            "contract_ref, meta, created_at, updated_at) "
+            "VALUES ('legacy', NULL, 'component', 'legacy', NULL, "
+            "'../../../etc/passwd', NULL, 1, 1)"
+        )
+        self.store.conn.commit()
+        c = self.store.get_contract("legacy")
+        self.assertIsNone(c["contract_text"])
+        self.assertIsNone(c["contract_path"])
+
+    def test_get_tree_depth_limit(self):
+        self._seed()
+        with self.assertRaises(ValidationError):
+            self.store.get_tree(depth=1000)
+
+    def test_get_tree_cycle_detected(self):
+        self.store.create_node("a", kind="root", name="a")
+        self.store.create_node("a/b", parent_path="a", kind="component", name="b")
+        # Corrupt the hierarchy into a cycle (a -> a/b -> a).
+        self.store.conn.execute(
+            "UPDATE worktree_nodes SET parent_path = 'a/b' WHERE path = 'a'"
+        )
+        self.store.conn.commit()
+        with self.assertRaises(ConflictError):
+            self.store.get_tree("a", depth=5)
+
+    def test_import_transaction_rollback(self):
+        self.store.create_node("dup", kind="root", name="dup")
+        with self.assertRaises(ConflictError):
+            self.store.import_nodes(
+                source="agents",
+                nodes=[
+                    {"path": "new1", "kind": "root", "name": "new1"},
+                    {"path": "dup", "kind": "root", "name": "dup"},
+                ],
+            )
+        # Nothing from the failed batch may remain (single transaction).
+        self.assertIsNone(self.store.get_node("new1"))
+
+    def test_import_root_path_scopes_batch(self):
+        with self.assertRaises(ValidationError):
+            self.store.import_nodes(
+                source="agents",
+                root_path="scope",
+                nodes=[{"path": "outside", "kind": "root", "name": "x"}],
+            )
 
 
 class TestHTTPServer(unittest.TestCase):
@@ -447,6 +574,36 @@ class TestHTTPServer(unittest.TestCase):
 
     def test_missing_node_404(self):
         status, body = self._req("GET", "/v1/worktree/nodes/does/not/exist")
+        self.assertEqual(status, 404)
+
+    def test_body_must_be_object(self):
+        status, body = self._req("POST", "/v1/worktree/nodes", [1, 2, 3])
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
+    def test_body_too_large_400(self):
+        big = {"path": "x", "pad": "a" * (server.MAX_BODY_BYTES + 1)}
+        status, body = self._req("POST", "/v1/worktree/nodes", big)
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
+    def test_contract_traversal_http(self):
+        # An unsafe contract_ref is rejected at create time (400).
+        status, body = self._req(
+            "POST",
+            "/v1/worktree/nodes",
+            {"path": "trav", "kind": "component", "name": "trav",
+             "contract_ref": "../../etc/passwd"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
+    def test_create_missing_parent_404(self):
+        status, body = self._req(
+            "POST",
+            "/v1/worktree/nodes",
+            {"path": "orphan/x", "kind": "component", "parent_path": "orphan"},
+        )
         self.assertEqual(status, 404)
 
     def _seed_http(self, prefix):

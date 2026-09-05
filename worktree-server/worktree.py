@@ -23,6 +23,61 @@ LINK_KINDS = ("contract", "session", "memory")
 
 DB_FILENAME = "worktree.db"
 
+# Soft limits applied at the API boundary (security / resource guards).
+MAX_PATH_LEN = 512           # max length of a normalized node path / contract_ref
+MAX_CONTRACT_BYTES = 1024 * 1024  # max bytes of a contract file we read (~1MB)
+MAX_TREE_DEPTH = 50          # max tree levels we will recurse before 400
+
+
+def normalize_path(p):
+    """Return ``p`` if it is a safe, canonical store path (no traversal).
+
+    Rejects non-strings, empty paths, NUL bytes, over-long paths (>512), and
+    any path containing an empty / ``.`` / ``..`` segment (which also rules out
+    absolute paths, since those start with an empty segment).  Used uniformly
+    by create/update and by the API routes so a single encoding governs all
+    ``path`` / ``parent_path`` input.
+    """
+    if p is None:
+        raise ValidationError("path is required")
+    if not isinstance(p, str):
+        raise ValidationError("path must be a string")
+    if not p:
+        raise ValidationError("path must not be empty")
+    if "\x00" in p:
+        raise ValidationError("path contains NUL byte")
+    if len(p) > MAX_PATH_LEN:
+        raise ValidationError("path exceeds %d characters" % MAX_PATH_LEN)
+    segments = p.split("/")
+    if any(s in ("", ".", "..") for s in segments):
+        raise ValidationError("path contains an invalid segment")
+    return p
+
+
+def validate_contract_ref(ref):
+    """Validate a ``contract_ref`` so it can never escape ``contract_base``.
+
+    ``None``/empty is allowed (a node may have no contract).  Otherwise ``ref``
+    must be a relative path whose segments are all non-empty and not ``.`` /
+    ``..``, with no NUL byte and within ``MAX_PATH_LEN``.  Enforced on write
+    (create/update/import) so a traversal ref is rejected with 400 up front.
+    """
+    if not ref:
+        return ref
+    if not isinstance(ref, str):
+        raise ValidationError("contract_ref must be a string")
+    if "\x00" in ref:
+        raise ValidationError("contract_ref contains NUL byte")
+    if os.path.isabs(ref):
+        raise ValidationError("contract_ref must be a relative path")
+    if any(s in ("", ".", "..") for s in ref.replace("\\", "/").split("/")):
+        raise ValidationError("contract_ref contains an invalid segment")
+    if len(ref) > MAX_PATH_LEN:
+        raise ValidationError(
+            "contract_ref exceeds %d characters" % MAX_PATH_LEN
+        )
+    return ref
+
 
 class WorktreeError(Exception):
     """Base error for this module."""
@@ -153,6 +208,53 @@ class WorktreeStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def _collect_subtree_paths(self, path):
+        """Return all descendant node *paths* of ``path`` (excluding ``path``).
+
+        Walks the actual ``parent_path`` links, so it is correct even if the
+        stored hierarchy does not match the path-string prefix (corrupt data).
+        """
+        rows = self.conn.execute(
+            "SELECT path, parent_path FROM worktree_nodes"
+        ).fetchall()
+        children = {}
+        for r in rows:
+            children.setdefault(r["parent_path"], []).append(r["path"])
+        out = []
+        stack = list(children.get(path, []))
+        while stack:
+            p = stack.pop()
+            out.append(p)
+            stack.extend(children.get(p, []))
+        return out
+
+    def _ensure_parent_ok(self, path, parent_path, batch_paths=None):
+        """Validate ``parent_path`` for a node at ``path`` (create/update).
+
+        Enforces: no self-parenting, no cycle (parent must not be a descendant
+        of the node), and that the referenced parent exists.  ``batch_paths``
+        may be a set of paths being created together (import), in which case a
+        parent may exist within that batch rather than in the DB.
+        """
+        if not parent_path:
+            return
+        if parent_path == path:
+            raise ValidationError(
+                "cycle: a node cannot be its own parent (%s)" % path
+            )
+        if parent_path in self._collect_subtree_paths(path):
+            raise ValidationError(
+                "cycle: parent %r is a descendant of %r" % (parent_path, path)
+            )
+        if batch_paths is not None:
+            if parent_path in batch_paths:
+                return
+            if self.get_node(parent_path) is None:
+                raise NotFoundError("parent node not found: %s" % parent_path)
+            return
+        if self.get_node(parent_path) is None:
+            raise NotFoundError("parent node not found: %s" % parent_path)
+
     # ------------------------------------------------------------ node CRUD
 
     def create_node(
@@ -167,8 +269,9 @@ class WorktreeStore:
         workspace=None,
     ):
         """Create a node; raises ConflictError if ``path`` already exists."""
-        if not path or not isinstance(path, str):
-            raise ValidationError("path is required")
+        path = normalize_path(path)
+        parent_path = normalize_path(parent_path) if parent_path else None
+        contract_ref = validate_contract_ref(contract_ref)
         if kind not in KINDS:
             raise ValidationError("invalid kind: %s" % kind)
         m = dict(meta) if isinstance(meta, dict) else {}
@@ -178,6 +281,8 @@ class WorktreeStore:
             name = path.split("/")[-1]
         now = self._now()
         with self.lock:
+            # A node's parent must already exist and must not introduce a cycle.
+            self._ensure_parent_ok(path, parent_path)
             try:
                 self.conn.execute(
                     """
@@ -231,6 +336,9 @@ class WorktreeStore:
 
     def update_node(self, path, data):
         """Patch an existing node (contract §3.2 POST /nodes/<path>)."""
+        path = normalize_path(path)
+        if data is None or not isinstance(data, dict):
+            raise ValidationError("update body must be a JSON object")
         with self.lock:
             row = self._get_node_row(path)
             if row is None:
@@ -245,9 +353,14 @@ class WorktreeStore:
             if "desc" in data:
                 updates["desc"] = data["desc"]
             if "contract_ref" in data:
-                updates["contract_ref"] = data["contract_ref"]
+                updates["contract_ref"] = validate_contract_ref(data["contract_ref"])
             if "parent_path" in data:
-                updates["parent_path"] = data["parent_path"]
+                new_parent = data["parent_path"]
+                if new_parent:
+                    new_parent = normalize_path(new_parent)
+                updates["parent_path"] = new_parent
+                # Moving a node must not create a cycle or point at a missing node.
+                self._ensure_parent_ok(path, new_parent)
             if "kind" in data:
                 if data["kind"] not in KINDS:
                     raise ValidationError("invalid kind: %s" % data["kind"])
@@ -270,18 +383,33 @@ class WorktreeStore:
             return self.get_node(path)
 
     def delete_node(self, path):
-        """Delete a node and its links (contract §3.2 DELETE /nodes/<path>)."""
+        """Delete a node and its subtree (cascade), plus all their links.
+
+        Contract §3.2 DELETE /nodes/<path> deletes the node and its links; to
+        keep the tree consistent the whole subtree under ``path`` is removed.
+        """
+        path = normalize_path(path)
         with self.lock:
             node = self.get_node(path)
             if node is None:
                 raise NotFoundError(path)
-            linked = self.conn.execute(
-                "SELECT COUNT(*) FROM node_links WHERE node_id = ?", (node["id"],)
-            ).fetchone()[0]
-            self.conn.execute("DELETE FROM node_links WHERE node_id = ?", (node["id"],))
-            self.conn.execute("DELETE FROM worktree_nodes WHERE id = ?", (node["id"],))
+            # Collect the node id plus every descendant id (subtree).
+            ids = [node["id"]]
+            for p in self._collect_subtree_paths(path):
+                r = self._get_node_row(p)
+                if r is not None:
+                    ids.append(r["id"])
+            placeholders = ",".join("?" for _ in ids)
+            cur = self.conn.execute(
+                "DELETE FROM node_links WHERE node_id IN (%s)" % placeholders, ids
+            )
+            linked = cur.rowcount
+            cur = self.conn.execute(
+                "DELETE FROM worktree_nodes WHERE id IN (%s)" % placeholders, ids
+            )
+            deleted = cur.rowcount
             self.conn.commit()
-            return {"ok": True, "deleted": 1, "links": linked}
+            return {"ok": True, "deleted": deleted, "links": linked}
 
     # ------------------------------------------------------------ tree
 
@@ -298,6 +426,10 @@ class WorktreeStore:
             depth = 1
         if depth < 0:
             depth = 0
+        if depth > MAX_TREE_DEPTH:
+            raise ValidationError("tree depth exceeds %d" % MAX_TREE_DEPTH)
+        if root_path:
+            root_path = normalize_path(root_path)
         with self.lock:
             nodes = self.list_nodes(workspace)
             by_path = {n["path"]: n for n in nodes}
@@ -307,11 +439,20 @@ class WorktreeStore:
             for key in children_map:
                 children_map[key].sort(key=lambda x: x["path"])
 
-            def build(node, remaining):
+            def build(node, remaining, stack):
+                if node["path"] in stack:
+                    raise ConflictError(
+                        "tree cycle detected at node %r" % node["path"]
+                    )
+                if len(stack) >= MAX_TREE_DEPTH:
+                    raise ValidationError(
+                        "tree depth exceeds %d" % MAX_TREE_DEPTH
+                    )
                 item = dict(node)
+                next_stack = stack + [node["path"]]
                 if remaining > 0:
                     item["children"] = [
-                        build(c, remaining - 1)
+                        build(c, remaining - 1, next_stack)
                         for c in children_map.get(node["path"], [])
                     ]
                 else:
@@ -325,7 +466,7 @@ class WorktreeStore:
                 return {
                     "root": root,
                     "children": [
-                        build(c, depth - 1)
+                        build(c, depth - 1, [])
                         for c in children_map.get(root["path"], [])
                     ],
                 }
@@ -334,7 +475,7 @@ class WorktreeStore:
             roots.sort(key=lambda x: x["path"])
             return {
                 "root": None,
-                "children": [build(r, depth - 1) for r in roots],
+                "children": [build(r, depth - 1, []) for r in roots],
             }
 
     # ------------------------------------------------------------ ancestors
@@ -360,6 +501,48 @@ class WorktreeStore:
 
     # ------------------------------------------------------------ contract
 
+    def _resolve_contract_ref(self, ref):
+        """Resolve ``ref`` to a real path strictly inside ``contract_base``.
+
+        Returns ``(abs_path, display_path)`` or ``(None, None)``.  A ``ref``
+        that is absolute, traverses upward with ``..``/``.``, or contains a NUL
+        byte is rejected outright (no file is ever opened).  ``display_path`` is
+        base-relative so the API never leaks an internal absolute path.
+        """
+        if not ref:
+            return None, None
+        if "\x00" in ref:
+            return None, None
+        if os.path.isabs(ref):
+            return None, None
+        if any(s in ("", ".", "..") for s in ref.replace("\\", "/").split("/")):
+            return None, None
+        base = os.path.realpath(self.contract_base)
+        candidate = os.path.realpath(os.path.join(base, ref))
+        try:
+            common = os.path.commonpath([base, candidate])
+        except ValueError:
+            return None, None
+        if common != base:
+            return None, None
+        return candidate, os.path.relpath(candidate, base)
+
+    def _read_contract_file(self, path):
+        """Read a contract file, capping at ~``MAX_CONTRACT_BYTES``.
+
+        Oversized files are truncated to ``MAX_CONTRACT_BYTES`` and suffixed
+        with a marker so callers can tell the payload was clipped.
+        """
+        with open(path, "rb") as fh:
+            raw = fh.read(MAX_CONTRACT_BYTES + 1)
+        truncated = len(raw) > MAX_CONTRACT_BYTES
+        if truncated:
+            raw = raw[:MAX_CONTRACT_BYTES]
+        text = raw.decode("utf-8", errors="replace")
+        if truncated:
+            text += "\n... [truncated: contract exceeds %d bytes]" % MAX_CONTRACT_BYTES
+        return text
+
     def get_contract(self, path):
         """Return the contract payload (contract §3.5)."""
         with self.lock:
@@ -367,14 +550,14 @@ class WorktreeStore:
             if node is None:
                 raise NotFoundError(path)
             ref = node["contract_ref"]
-            cpath = None
+            abs_path = None
+            display_path = None
             if ref:
-                cpath = os.path.abspath(os.path.join(self.contract_base, ref))
+                abs_path, display_path = self._resolve_contract_ref(ref)
             text = None
-            if cpath and os.path.isfile(cpath):
+            if abs_path and os.path.isfile(abs_path):
                 try:
-                    with open(cpath, "r", encoding="utf-8") as fh:
-                        text = fh.read()
+                    text = self._read_contract_file(abs_path)
                 except OSError:
                     text = None
             links = self._get_links(node["id"])
@@ -382,24 +565,35 @@ class WorktreeStore:
                 "node": node,
                 "contract_ref": ref,
                 "contract_text": text,
-                "contract_path": cpath,
+                "contract_path": display_path,
                 "links": links,
             }
 
     # ------------------------------------------------------------ session links
 
     def set_session_link(self, node_path, session_id):
-        """Upsert (idempotent) a session link (contract §3.6)."""
+        """Mount a session on exactly one node (delete-then-insert).
+
+        A ``session_id`` is unique across the service: re-mounting the same
+        session on a *different* node first removes the previous link so the
+        session never points at two nodes.
+        """
+        node_path = normalize_path(node_path)
         with self.lock:
             node = self.get_node(node_path)
             if node is None:
                 raise NotFoundError(node_path)
             now = self._now()
+            # Drop any existing link for this session (on any node) first, so a
+            # session is mounted on exactly one node.
+            self.conn.execute(
+                "DELETE FROM node_links WHERE kind = 'session' AND ref = ?",
+                (session_id,),
+            )
             self.conn.execute(
                 """
                 INSERT INTO node_links (node_id, kind, ref, created_at)
                 VALUES (?, 'session', ?, ?)
-                ON CONFLICT(node_id, kind, ref) DO UPDATE SET created_at = excluded.created_at
                 """,
                 (node["id"], session_id, now),
             )
@@ -434,30 +628,116 @@ class WorktreeStore:
     # ------------------------------------------------------------ import
 
     def import_nodes(self, source, root_path=None, workspace=None, nodes=None):
-        """Create a batch of nodes (contract §3.7).
+        """Create a batch of nodes in a single transaction (contract §3.7).
 
         ``source`` must be ``agents`` or ``frontmatter``.  ``nodes`` carries the
         actual node dicts to materialise (the parsing of AGENTS.md / frontmatter
         belongs to P3; this store just persists what it is given).
+
+        The whole batch is committed atomically: if any node fails validation or
+        insertion, the transaction is rolled back and nothing is left behind.
+        ``root_path`` (when given) scopes the batch: every node path must be
+        under it.
         """
         if source not in ("agents", "frontmatter"):
             raise ValidationError("invalid import source: %s" % source)
-        created = []
-        for item in nodes or []:
+        items = list(nodes or [])
+        if not items:
+            return {"imported": 0, "nodes": []}
+
+        # --- pre-validation (nothing written yet) ---
+        batch_paths = set()
+        for item in items:
             if not isinstance(item, dict):
                 raise ValidationError("each imported node must be an object")
             path = item.get("path")
             if not path:
                 raise ValidationError("each imported node requires a path")
-            node = self.create_node(
-                path=path,
-                parent_path=item.get("parent_path"),
-                kind=item.get("kind", "component"),
-                name=item.get("name"),
-                desc=item.get("desc"),
-                contract_ref=item.get("contract_ref"),
-                meta=item.get("meta"),
-                workspace=item.get("workspace", workspace),
+            normalize_path(path)
+            batch_paths.add(path)
+        if root_path:
+            rp = root_path.rstrip("/")
+            normalize_path(rp)
+            for path in batch_paths:
+                if not (path == rp or path.startswith(rp + "/")):
+                    raise ValidationError(
+                        "node path %r is not under root_path %r" % (path, rp)
+                    )
+
+        prepared = []
+        seen = set()
+        for item in items:
+            path = normalize_path(item["path"])
+            if path in seen:
+                raise ConflictError("duplicate node path %r in import" % path)
+            seen.add(path)
+            parent = (
+                normalize_path(item.get("parent_path"))
+                if item.get("parent_path")
+                else None
             )
-            created.append(node)
+            kind = item.get("kind", "component")
+            if kind not in KINDS:
+                raise ValidationError("invalid kind: %s" % kind)
+            if parent:
+                if parent == path:
+                    raise ValidationError(
+                        "cycle: a node cannot be its own parent (%s)" % path
+                    )
+                if parent.startswith(path + "/"):
+                    raise ValidationError(
+                        "cycle: parent %r is a descendant of %r" % (parent, path)
+                    )
+                if parent not in batch_paths and self.get_node(parent) is None:
+                    raise NotFoundError("parent node not found: %s" % parent)
+            m = dict(item.get("meta")) if isinstance(item.get("meta"), dict) else {}
+            if item.get("workspace") is not None:
+                m["workspace"] = item["workspace"]
+            elif workspace is not None:
+                m["workspace"] = workspace
+            prepared.append(
+                {
+                    "path": path,
+                    "parent_path": parent,
+                    "kind": kind,
+                    "name": item.get("name") or path.split("/")[-1],
+                    "desc": item.get("desc"),
+                    "contract_ref": validate_contract_ref(item.get("contract_ref")),
+                    "meta": json.dumps(m, ensure_ascii=False),
+                }
+            )
+
+        # --- single transaction: all-or-nothing ---
+        now = self._now()
+        with self.lock:
+            try:
+                created = []
+                for rec in prepared:
+                    cur = self.conn.execute(
+                        """
+                        INSERT INTO worktree_nodes
+                          (path, parent_path, kind, name, desc, contract_ref,
+                           meta, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            rec["path"],
+                            rec["parent_path"],
+                            rec["kind"],
+                            rec["name"],
+                            rec["desc"],
+                            rec["contract_ref"],
+                            rec["meta"],
+                            now,
+                            now,
+                        ),
+                    )
+                    created.append(self._get_node_by_id(cur.lastrowid))
+                self.conn.commit()
+            except sqlite3.IntegrityError as exc:
+                self.conn.rollback()
+                raise ConflictError("node path exists during import") from exc
+            except Exception:
+                self.conn.rollback()
+                raise
         return {"imported": len(created), "nodes": created}
